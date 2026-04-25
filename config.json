@@ -1,0 +1,9 @@
+{
+  "blocked_domains": [
+    "example.com"
+  ],
+  "blocked_urls": [
+    "http://live.legendy.by:8000/legendyfm"
+  ]
+}
+
