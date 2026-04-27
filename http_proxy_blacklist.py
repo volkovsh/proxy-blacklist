@@ -1,16 +1,19 @@
 #!/usr/bin/env python3
 
-"""
-Лаба 4 (доп): HTTP-прокси с журналированием и фильтрацией по чёрному списку.
-
-Поддерживается только HTTP. HTTPS/CONNECT не требуется и возвращает 501.
-
-Чёрный список задаётся в конфигурационном файле и может содержать:
-- домены (blocked_domains) — блокировка по host (точное совпадение или по суффиксу)
-- URL (blocked_urls) — блокировка по префиксу полного URL (scheme://host[:port]/path?query)
-
-Если ресурс заблокирован, прокси возвращает предопределённую HTML-страницу и код 403.
-"""
+# Лаба 4 (доп): простой HTTP-прокси на сокетах.
+#
+# Что делает:
+# - принимает HTTP-запросы от браузера (клиента);
+# - проксирует запрос на сервер назначения (upstream) и возвращает ответ клиенту;
+# - пишет в консоль журнал: URL и код ответа;
+# - фильтрует домены/URL по чёрному списку и при блокировке возвращает HTML с 403.
+#
+# Важная деталь для прокси:
+# браузер отправляет request-line в absolute-form (полный URL), например:
+#     GET http://live.legendy.by:8000/legendyfm HTTP/1.1
+# но сервер назначения обычно ждёт origin-form (только путь):
+#     GET /legendyfm HTTP/1.1
+# Поэтому прокси переписывает target из absolute-form в origin-form перед отправкой upstream.
 
 import argparse
 import json
@@ -18,6 +21,7 @@ import socket
 import threading
 import time
 from dataclasses import dataclass
+from http import HTTPStatus
 from typing import Dict, List, Optional, Tuple
 from urllib.parse import urlsplit
 
@@ -26,8 +30,27 @@ CRLF = b"\r\n"
 HEADER_END = b"\r\n\r\n"
 
 
+def _status_phrase(code: int) -> str:
+    # Вернуть текстовое имя статуса (200 -> OK) для логов.
+    try:
+        return HTTPStatus(code).phrase
+    except ValueError:
+        return ""
+
+
 @dataclass
 class ParsedRequest:
+    # Результат разбора HTTP-запроса клиента.
+    #
+    # raw_target — target из request-line клиента (может быть полный URL при работе через прокси).
+    #
+    # Заголовки храним в двух видах:
+    # - headers: доступ по lower-case ключам
+    # - header_items: исходный порядок/регистр для пересылки upstream
+    #
+    # path — путь в origin-form (включая query), который уйдёт на сервер назначения.
+    # absolute_url — нормализованный абсолютный URL (удобен для лога и blacklist URL).
+
     method: str
     raw_target: str
     version: str
@@ -41,11 +64,14 @@ class ParsedRequest:
 
 @dataclass
 class ProxyConfig:
+    # Конфигурация чёрного списка.
+
     blocked_domains: List[str]
     blocked_urls: List[str]
 
 
 def load_config(path: str) -> ProxyConfig:
+    # Загрузить JSON конфиг с blocked_domains/blocked_urls.
     with open(path, "r", encoding="utf-8") as f:
         raw = json.load(f)
     blocked_domains = raw.get("blocked_domains", [])
@@ -61,6 +87,8 @@ def load_config(path: str) -> ProxyConfig:
 
 
 def _recv_until(sock: socket.socket, marker: bytes, limit: int = 256 * 1024) -> bytes:
+    # Читать из TCP-сокета, пока не встретим marker.
+    # Для HTTP marker=CRLFCRLF, то есть конец заголовков.
     buf = bytearray()
     while marker not in buf:
         chunk = sock.recv(4096)
@@ -73,6 +101,7 @@ def _recv_until(sock: socket.socket, marker: bytes, limit: int = 256 * 1024) -> 
 
 
 def _parse_headers(header_block: bytes) -> Tuple[str, str, str, Tuple[Tuple[str, str], ...], Dict[str, str]]:
+    # Разобрать request-line и заголовки из блока, заканчивающегося CRLFCRLF.
     head, _sep, _rest = header_block.partition(HEADER_END)
     lines = head.split(CRLF)
     if not lines or not lines[0]:
@@ -100,10 +129,10 @@ def _parse_headers(header_block: bytes) -> Tuple[str, str, str, Tuple[Tuple[str,
 
 
 def _determine_upstream(target: str, headers_lc: Dict[str, str]) -> Tuple[str, int, str, str]:
-    """
-    Returns (host, port, path, absolute_url).
-    Supports absolute-form and origin-form.
-    """
+    # Returns (host, port, path, absolute_url).
+    # Supports absolute-form and origin-form.
+    #
+    # absolute-form: "http://host:port/path?query" (браузер при работе через прокси)
     if target.startswith("http://") or target.startswith("https://"):
         u = urlsplit(target)
         if not u.hostname:
@@ -116,6 +145,8 @@ def _determine_upstream(target: str, headers_lc: Dict[str, str]) -> Tuple[str, i
         absolute_url = f"{u.scheme}://{host}:{port}{path}"
         return host, port, path, absolute_url
 
+    # origin-form: "/path?query" (если клиент прислал не полный URL).
+    # Хост/порт берём из заголовка Host.
     host_hdr = headers_lc.get("host")
     if not host_hdr:
         raise ValueError("Missing Host header")
@@ -135,6 +166,11 @@ def _determine_upstream(target: str, headers_lc: Dict[str, str]) -> Tuple[str, i
 
 
 def parse_client_request(client_sock: socket.socket) -> Tuple[ParsedRequest, bytes]:
+    # Прочитать запрос клиента:
+    # - заголовки до CRLFCRLF
+    # - разобрать method/target/version + заголовки
+    # - определить host/port/path
+    # Возвращает ParsedRequest и остаток байт, которые пришли сразу после заголовков (начало body).
     raw = _recv_until(client_sock, HEADER_END)
     if not raw:
         raise ValueError("Client closed")
@@ -160,6 +196,10 @@ def parse_client_request(client_sock: socket.socket) -> Tuple[ParsedRequest, byt
 
 
 def build_upstream_request(req: ParsedRequest) -> bytes:
+    # Сформировать запрос к upstream:
+    # - request-line переписываем в origin-form (req.path)
+    # - proxy-specific заголовки удаляем
+    # - выставляем Connection: close для предсказуемой прокачки ответов
     request_line = f"{req.method} {req.path} {req.version}\r\n"
 
     out_lines = [request_line]
@@ -177,12 +217,15 @@ def build_upstream_request(req: ParsedRequest) -> bytes:
     if not seen_host:
         out_lines.append(f"Host: {req.host}:{req.port}\r\n")
 
+    # Просим upstream закрыть соединение после ответа:
+    # так проще корректно дочитать длинные ответы/стрим до конца.
     out_lines.append("Connection: close\r\n")
     out_lines.append("\r\n")
     return "".join(out_lines).encode("iso-8859-1")
 
 
 def _read_response_headers(upstream: socket.socket) -> Tuple[bytes, int, bytes]:
+    # Прочитать заголовки ответа и извлечь status code из первой строки.
     raw = _recv_until(upstream, HEADER_END)
     if not raw:
         raise ValueError("Upstream closed before response")
@@ -201,6 +244,7 @@ def _read_response_headers(upstream: socket.socket) -> Tuple[bytes, int, bytes]:
 
 
 def _relay_stream(src: socket.socket, dst: socket.socket, initial: bytes = b"") -> None:
+    # Потоковая прокачка байт без буферизации целого ответа (важно для радио).
     if initial:
         dst.sendall(initial)
     while True:
@@ -211,11 +255,7 @@ def _relay_stream(src: socket.socket, dst: socket.socket, initial: bytes = b"") 
 
 
 def _domain_is_blocked(host: str, blocked_domains: List[str]) -> bool:
-    """
-    Блокировка по домену:
-    - точное совпадение
-    - или суффикс: example.com блокирует a.example.com
-    """
+    # Проверка по домену: точное совпадение или суффикс (example.com блокирует a.example.com).
     h = host.lower().strip(".")
     for d in blocked_domains:
         if h == d or h.endswith("." + d):
@@ -224,7 +264,7 @@ def _domain_is_blocked(host: str, blocked_domains: List[str]) -> bool:
 
 
 def _url_is_blocked(url: str, blocked_urls: List[str]) -> bool:
-    """Блокировка по URL: совпадение по префиксу (startsWith)."""
+    # Проверка по URL: совпадение по префиксу (startsWith).
     for u in blocked_urls:
         if url.startswith(u):
             return True
@@ -232,11 +272,13 @@ def _url_is_blocked(url: str, blocked_urls: List[str]) -> bool:
 
 
 def is_blocked(req: ParsedRequest, cfg: ProxyConfig) -> bool:
+    # Итоговая проверка ресурса по чёрному списку (домен ИЛИ URL).
     return _domain_is_blocked(req.host, cfg.blocked_domains) or _url_is_blocked(req.absolute_url, cfg.blocked_urls)
 
 
 def build_block_page(blocked_url: str) -> bytes:
-    body = f"""<!doctype html>
+    # Сформировать ответ 403 с HTML-страницей о блокировке.
+    body = f'''<!doctype html>
 <html lang="ru">
 <head>
   <meta charset="utf-8" />
@@ -256,7 +298,7 @@ def build_block_page(blocked_url: str) -> bytes:
   </div>
 </body>
 </html>
-""".encode("utf-8")
+'''.encode("utf-8")
 
     hdr = (
         b"HTTP/1.1 403 Forbidden\r\n"
@@ -274,6 +316,11 @@ def handle_client(
     connect_timeout_s: float,
     cfg: ProxyConfig,
 ) -> None:
+    # Обработка одного клиента (соединения браузера) в отдельном потоке:
+    # - читаем запрос
+    # - проверяем blacklist
+    # - соединяемся с upstream
+    # - прокачиваем ответ и логируем код
     upstream: Optional[socket.socket] = None
     try:
         try:
@@ -281,27 +328,34 @@ def handle_client(
         except ValueError:
             return
 
+        # CONNECT обычно используется для HTTPS-туннеля. Здесь не реализуем туннель, возвращаем 501.
         if req.method.upper() == "CONNECT":
             client_sock.sendall(
                 b"HTTP/1.1 501 Not Implemented\r\nConnection: close\r\nContent-Length: 0\r\n\r\n"
             )
             return
 
+        # Доп. задание: блокировка по чёрному списку.
         if is_blocked(req, cfg):
             client_sock.sendall(build_block_page(req.absolute_url))
             ts = time.strftime("%H:%M:%S")
-            print(f"[{ts}] {client_addr[0]}:{client_addr[1]} -> {req.absolute_url} => 403 (BLOCKED)")
+            print(
+                f"[{ts}] {client_addr[0]}:{client_addr[1]} -> {req.absolute_url} => 403 {_status_phrase(403)} (BLOCKED)"
+            )
             return
 
+        # Подключаемся к серверу назначения.
         upstream = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         upstream.settimeout(connect_timeout_s)
         upstream.connect((req.host, req.port))
         upstream.settimeout(None)
 
+        # Отправляем upstream запрос с переписанным request-line.
         upstream.sendall(build_upstream_request(req))
         if body_remainder:
             upstream.sendall(body_remainder)
 
+        # Если клиент уже отправляет тело (POST/PUT), докидываем ещё немного без долгой блокировки.
         client_sock.settimeout(0.2)
         try:
             while True:
@@ -316,12 +370,17 @@ def handle_client(
         finally:
             client_sock.settimeout(None)
 
+        # Читаем заголовки ответа: нужен status code для лога.
         resp_header_bytes, status_code, resp_remainder = _read_response_headers(upstream)
         client_sock.sendall(resp_header_bytes)
 
+        # Основное требование: логировать URL и код ответа.
         ts = time.strftime("%H:%M:%S")
-        print(f"[{ts}] {client_addr[0]}:{client_addr[1]} -> {req.absolute_url} => {status_code}")
+        phrase = _status_phrase(status_code)
+        suffix = f" {phrase}" if phrase else ""
+        print(f"[{ts}] {client_addr[0]}:{client_addr[1]} -> {req.absolute_url} => {status_code}{suffix}")
 
+        # Проксируем тело ответа потоково (важно для долгих ответов/радио).
         _relay_stream(upstream, client_sock, initial=resp_remainder)
     except OSError:
         return
@@ -338,6 +397,7 @@ def handle_client(
 
 
 def serve(listen_host: str, listen_port: int, connect_timeout_s: float, cfg: ProxyConfig) -> None:
+    # Запуск TCP сервера и принятие входящих соединений.
     server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     server.bind((listen_host, listen_port))
@@ -348,6 +408,7 @@ def serve(listen_host: str, listen_port: int, connect_timeout_s: float, cfg: Pro
     try:
         while True:
             client_sock, client_addr = server.accept()
+            # Многопоточность: каждое подключение браузера обслуживается в отдельном потоке.
             t = threading.Thread(
                 target=handle_client,
                 args=(client_sock, client_addr, connect_timeout_s, cfg),
@@ -360,7 +421,7 @@ def serve(listen_host: str, listen_port: int, connect_timeout_s: float, cfg: Pro
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HTTP proxy with logging + blacklist (lab 4 extra)")
-    p.add_argument("--listen-host", default="0.0.0.0", help="Host/IP to listen on")
+    p.add_argument("--listen-host", default="127.0.0.1", help="Host/IP to listen on")
     p.add_argument("--listen-port", type=int, default=8080, help="TCP port to listen on")
     p.add_argument("--connect-timeout", type=float, default=5.0, help="Upstream connect timeout (seconds)")
     p.add_argument("--config", default="config.json", help="Path to JSON config with blacklist")
