@@ -360,7 +360,7 @@ def serve(listen_host: str, listen_port: int, connect_timeout_s: float, cfg: Pro
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="HTTP proxy with logging + blacklist (lab 4 extra)")
-    p.add_argument("--listen-host", default="127.0.0.1", help="Host/IP to listen on")
+    p.add_argument("--listen-host", default="0.0.0.0", help="Host/IP to listen on")
     p.add_argument("--listen-port", type=int, default=8080, help="TCP port to listen on")
     p.add_argument("--connect-timeout", type=float, default=5.0, help="Upstream connect timeout (seconds)")
     p.add_argument("--config", default="config.json", help="Path to JSON config with blacklist")

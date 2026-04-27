@@ -14,7 +14,7 @@
 ## Запуск
 
 ```bash
-python3 http_proxy_blacklist.py --listen-host 127.0.0.1 --listen-port 8080 --config config.json
+python3 http_proxy_blacklist.py --listen-host 0.0.0.0 --listen-port 8080 --config config.json
 ```
 
 ## Поведение при блокировке
